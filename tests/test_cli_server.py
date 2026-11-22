@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import plistlib
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -40,8 +40,9 @@ class Child:
         self.killed = True
         self.exit_code = -9
 
-    def wait(self, timeout):
-        self.waited.append(timeout)
+    def wait(self, timeout=None):
+        if timeout is not None:
+            self.waited.append(timeout)
         if self.timeout and not self.killed:
             raise subprocess.TimeoutExpired("child", timeout)
         return self.exit_code or 0
@@ -81,7 +82,7 @@ def test_server_import_has_no_api_or_data_side_effects(tmp_path):
     env = {**os.environ, "FOREST_DATA_DIR": str(data), "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     result = subprocess.run(
         [sys.executable, "-c", "import sys, forest_cli.server; assert 'services.api.db' not in sys.modules; assert 'services.api.config' not in sys.modules"],
-        cwd=tmp_path, env=env, capture_output=True, text=True,
+        check=False, cwd=tmp_path, env=env, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr
     assert not data.exists()
@@ -138,35 +139,44 @@ def test_headless_launches_only_api_and_worker_and_cleans_up(supervised, monkeyp
     monkeypatch.setattr(server.shutil, "which", lambda _: pytest.fail("Headless startup must not inspect Node/npm"))
     data = tmp_path / "data"
     assert server.serve(headless=True, port=8123, data_dir=data) == 0
-    assert [command[:3] for command, _ in supervised.run] == [[sys.executable, "-m", "services.api.db"]]
-    assert supervised.spawn[0][0] == [sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", "127.0.0.1", "--port", "8123", "--timeout-graceful-shutdown", "5"]
-    assert supervised.spawn[1][0] == [sys.executable, "-m", "services.worker.main"]
-    assert all(options["env"]["FOREST_DATABASE_URL"] == "sqlite:///" + str(data / "forest.db") for _, options in supervised.run + supervised.spawn)
-    assert all(child.terminated and child.waited == [10] for child in supervised.children)
+    assert supervised.run == []
+    launched = [command[3:] for command, _ in supervised.spawn]
+    assert launched == [
+        [sys.executable, "-m", "services.api.db"],
+        [sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", "127.0.0.1", "--port", "8123", "--timeout-graceful-shutdown", "5"],
+        [sys.executable, "-m", "services.worker.main"],
+    ]
+    assert all(command[1] == "-c" and "pthread_sigmask" in command[2] for command, _ in supervised.spawn)
+    assert all(options["env"]["FOREST_DATABASE_URL"] == "sqlite:///" + str(data / "forest.db") for _, options in supervised.spawn)
+    assert not supervised.children[0].terminated and supervised.children[0].waited == []
+    assert all(child.terminated and child.waited == [10] for child in supervised.children[1:])
     assert supervised.signals[-2:] == [(signal.SIGINT, signal.SIG_DFL), (signal.SIGTERM, signal.SIG_DFL)]
 
 
 def test_child_failure_propagates_exit_and_stops_peer(supervised, monkeypatch):
     def spawn(command, **kwargs):
-        child = Child(exit_code=7 if not supervised.children else None)
+        index = len(supervised.children)
+        child = Child(exit_code=7 if index == 1 else None)
         supervised.children.append(child)
         return child
     monkeypatch.setattr(server.subprocess, "Popen", spawn)
     assert server.serve(headless=True) == 7
     assert not supervised.children[0].terminated
-    assert supervised.children[1].terminated
+    assert not supervised.children[1].terminated
+    assert supervised.children[2].terminated
 
 
 def test_partial_launch_failure_cleans_existing_child(supervised, monkeypatch):
     def spawn(command, **kwargs):
-        if supervised.children:
+        if len(supervised.children) == 2:
             raise OSError("worker launch failed")
         child = Child()
         supervised.children.append(child)
         return child
     monkeypatch.setattr(server.subprocess, "Popen", spawn)
     assert server.serve(headless=True) == 1
-    assert supervised.children[0].terminated
+    assert not supervised.children[0].terminated
+    assert supervised.children[1].terminated
 
 
 def test_unresponsive_children_are_killed_then_reaped():
@@ -187,7 +197,7 @@ def test_web_build_and_dev_preserve_legacy_behavior(supervised, monkeypatch, tmp
     supervised.spawn.clear()
     assert server.serve(dev=True) == 0
     assert all(command[0] != "npm" for command, _ in supervised.run)
-    assert supervised.spawn[-1][0] == ["npm", "run", "dev", "--", "--host", "127.0.0.1"]
+    assert supervised.spawn[-1][0][3:] == ["npm", "run", "dev", "--", "--host", "127.0.0.1"]
     assert supervised.spawn[-1][1]["cwd"] == web
 
 
@@ -336,3 +346,88 @@ def test_service_remove_preserves_unit_until_manager_succeeds(monkeypatch, tmp_p
         service.main()
         assert not installed.exists()
     assert calls == [expected]
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="FOREST services run inside WSL2 on Windows"
+)
+def test_sigterm_during_database_initialization_stops_child(tmp_path):
+    import time
+
+    root = Path(__file__).resolve().parents[1]
+    pid_file = tmp_path / "initializer.pid"
+    stopped_file = tmp_path / "initializer.stopped"
+    child_source = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "def stop(*_):\n"
+        "    Path(os.environ['FOREST_TEST_INIT_STOPPED']).write_text('stopped')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "Path(os.environ['FOREST_TEST_INIT_PID']).write_text(str(os.getpid()))\n"
+        "time.sleep(300)\n"
+    )
+    parent_source = (
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "from forest_cli import server\n"
+        "real_popen = subprocess.Popen\n"
+        "def launch(command, *args, **kwargs):\n"
+        "    if command[3:] == [sys.executable, '-m', 'services.api.db']:\n"
+        f"        command = command[:3] + [sys.executable, '-c', {child_source!r}]\n"
+        "    return real_popen(command, *args, **kwargs)\n"
+        "subprocess.Popen = launch\n"
+        f"server.ROOT = Path({str(root)!r})\n"
+        "server.serve(headless=True, data_dir=os.environ['FOREST_DATA_DIR'])\n"
+    )
+    env = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "FOREST_DATA_DIR": str(tmp_path / "data"),
+        "FOREST_DATABASE_URL": "sqlite:///" + str(tmp_path / "forest.db"),
+        "FOREST_TEST_INIT_PID": str(pid_file),
+        "FOREST_TEST_INIT_STOPPED": str(stopped_file),
+        "PYTHONPATH": str(root),
+    }
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_source],
+        cwd=root,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            time.monotonic() < deadline
+            and not pid_file.exists()
+            and parent.poll() is None
+        ):
+            time.sleep(0.02)
+        assert pid_file.exists(), (
+            f"initializer did not start; parent status={parent.poll()}"
+        )
+        child_pid = int(pid_file.read_text())
+        parent.send_signal(signal.SIGTERM)
+        parent.wait(timeout=10)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not stopped_file.exists():
+            time.sleep(0.02)
+        assert stopped_file.exists(), (
+            "initializer child survived SIGTERM sent to forest serve"
+        )
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.communicate(timeout=5)
+        if child_pid is not None and not stopped_file.exists():
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not stopped_file.exists():
+                time.sleep(0.02)

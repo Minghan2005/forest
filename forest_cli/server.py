@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -68,6 +68,25 @@ def _stop_children(children) -> None:
             child.wait(timeout=5)
 
 
+def _start_child(command, *, cwd, env, children):
+    # Keep signals pending until the new child is in the cleanup list. The
+    # bootstrap unblocks them in the child before replacing itself with the
+    # requested process, so Popen does not need an unsafe preexec_fn.
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    bootstrap = (
+        "import os, signal, sys; "
+        "signal.pthread_sigmask(signal.SIG_SETMASK, set()); "
+        "os.execvpe(sys.argv[1], sys.argv[1:], os.environ)"
+    )
+    launch_command = [sys.executable, "-c", bootstrap, *command]
+    try:
+        child = subprocess.Popen(launch_command, cwd=cwd, env=env)
+        children.append(child)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    return child
+
+
 def serve(*, host="127.0.0.1", port=8000, data_dir=None, database_url=None, headless=False, dev=False) -> int:
     """Run independent API and worker processes until interrupted or one exits."""
     if os.name == "nt":
@@ -89,19 +108,24 @@ def serve(*, host="127.0.0.1", port=8000, data_dir=None, database_url=None, head
 
     try:
         _prepare_web(headless=headless, dev=dev, env=env)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, stop)
         # Importing the CLI/help must never create a database. Initialization is
         # confined to an explicit serve invocation in a separate interpreter.
-        subprocess.run([sys.executable, "-m", "services.api.db"], cwd=ROOT, env=env, check=True)
+        init_command = [sys.executable, "-m", "services.api.db"]
+        initializer = _start_child(init_command, cwd=ROOT, env=env, children=children)
+        init_code = initializer.wait()
+        children.remove(initializer)
+        if init_code:
+            raise subprocess.CalledProcessError(init_code, init_command)
         commands = [
             ([sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", host, "--port", str(port), "--timeout-graceful-shutdown", "5"], ROOT),
             ([sys.executable, "-m", "services.worker.main"], ROOT),
         ]
         if dev:
             commands.append((["npm", "run", "dev", "--", "--host", host], ROOT / "apps" / "web"))
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[signum] = signal.signal(signum, stop)
         for command, cwd in commands:
-            children.append(subprocess.Popen(command, cwd=cwd, env=env))
+            _start_child(command, cwd=cwd, env=env, children=children)
         endpoint_host = f"[{host}]" if ":" in host else host
         print(f"FOREST API: http://{endpoint_host}:{port}", flush=True)
         if dev:
