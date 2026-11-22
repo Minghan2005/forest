@@ -1,10 +1,13 @@
 """Editable research session, evidence lineage and run recovery views."""
-import json
 import filecmp
+import json
+
 from fastapi import APIRouter, Body
-from sqlalchemy import select,func
+from sqlalchemy import func, or_, select
+
+from .common import emit, error, get, project_dir, safe_path
 from .db import *
-from .common import get,project_dir,safe_path,emit,error
+
 router=APIRouter()
 
 @router.get('/api/projects/{ident}/research/route-health')
@@ -242,8 +245,12 @@ def graph_page(ident:str,offset:int=0,limit:int=100,branch_id:str|None=None,quer
         if query: stmt=stmt.where(Node.title.ilike('%'+query+'%'))
         nodes=list(s.scalars(stmt.order_by(Node.created_at,Node.id).offset(max(offset,0)).limit(min(max(limit,1),500))))
         ids={n.id for n in nodes}
-        edges=list(s.scalars(select(Edge).where(Edge.project_id==ident)))
-        return {'revision':p.revision,'offset':offset,'nodes':[asdict(n) for n in nodes],'edges':[asdict(e) for e in edges if e.source in ids or e.target in ids],'next_offset':offset+len(nodes) if len(nodes)==min(max(limit,1),500) else None}
+        edges=[]
+        if ids:
+            edges=list(s.scalars(select(Edge).where(
+                Edge.project_id==ident,
+                or_(Edge.source.in_(ids),Edge.target.in_(ids)))))
+        return {'revision':p.revision,'offset':offset,'nodes':[asdict(n) for n in nodes],'edges':[asdict(e) for e in edges],'next_offset':offset+len(nodes) if len(nodes)==min(max(limit,1),500) else None}
 
 @router.post('/api/projects/{ident}/protocol/validate')
 def validate_protocol(ident:str,body:dict=Body(...)):

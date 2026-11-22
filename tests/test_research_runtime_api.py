@@ -1,18 +1,22 @@
 """Real local API/database checks for editable planning and 200-node batches."""
-import os,subprocess,sys
+import os
+import subprocess
+import sys
 from pathlib import Path
+
 ROOT=Path(__file__).resolve().parents[1]
 
 def test_runtime_api_isolated(tmp_path):
  env={**os.environ,'FOREST_DATABASE_URL':'sqlite:///'+str(tmp_path/'api.db'),'FOREST_DATA_DIR':str(tmp_path/'data'),'FOREST_MODEL':'','PYTHONPATH':str(ROOT)}
  p=subprocess.run([sys.executable,__file__,'run'],cwd=ROOT,env=env,capture_output=True,text=True,timeout=120)
  assert p.returncode==0,p.stdout+p.stderr
-
 if __name__=='__main__':
  from fastapi.testclient import TestClient
- from services.api.main import app
- from services.api.db import Session,Project,TaskRun,uid
+ from sqlalchemy import event
+
  from research.planning.loop import apply_plan
+ from services.api.db import Edge, Project, Session, TaskRun, engine, uid
+ from services.api.main import app
  with TestClient(app) as c:
   p=c.post('/api/projects',json={'name':'Real graph scalability check','goal':'Execute user-defined experiments','mode':'manual'}).json();pid=p['id']
   assert p['budget']=={'allow_paid':False}
@@ -23,7 +27,41 @@ if __name__=='__main__':
   assert r.json()['node_count']==200
   assert c.post(f'/api/projects/{pid}/graph/batch',json=body).json()==r.json()
   page=c.get(f'/api/projects/{pid}/graph/page?offset=100&limit=40').json();assert len(page['nodes'])==40
-  g=c.get(f'/api/projects/{pid}/graph').json();assert len(g['edges'])==199
+  page_ids={node['id'] for node in page['nodes']}
+  first,last=page['nodes'][0]['id'],page['nodes'][-1]['id']
+  all_ids={node['id'] for node in c.get(f'/api/projects/{pid}/graph').json()['nodes']}
+  outside,outside2=list(all_ids-page_ids)[:2]
+  other=c.post('/api/projects',json={'name':'Separate graph project','goal':'Isolate project edges','mode':'manual'}).json()
+  with Session.begin() as s:
+   s.add(Edge(project_id=pid,source=outside,target=first,relation='incoming-test'))
+   s.add(Edge(project_id=pid,source=last,target=outside,relation='outgoing-test'))
+   s.add(Edge(project_id=pid,source=outside,target=outside2,relation='unrelated-test'))
+   s.add(Edge(project_id=other['id'],source=first,target=outside,relation='foreign-project-test'))
+  edge_queries=[]
+  def capture_edge_query(conn,cursor,statement,parameters,context,executemany):
+   normalized=' '.join(statement.lower().replace(chr(34),'').split())
+   if 'select ' in normalized and ' from edges ' in (' '+normalized+' '):
+    edge_queries.append(normalized)
+  event.listen(engine,'before_cursor_execute',capture_edge_query)
+  try:
+   page=c.get(f'/api/projects/{pid}/graph/page?offset=100&limit=40').json()
+   empty=c.get(f'/api/projects/{pid}/graph/page?offset=1000&limit=40').json()
+  finally:
+   event.remove(engine,'before_cursor_execute',capture_edge_query)
+  assert len(page['nodes'])==40
+  assert empty['nodes']==[] and empty['edges']==[]
+  assert len(edge_queries)==1,edge_queries
+  assert 'where' in edge_queries[0],edge_queries[0]
+  edge_where=edge_queries[0].split('where',1)[1]
+  assert 'edges.source in' in edge_where and 'edges.target in' in edge_where
+  g=c.get(f'/api/projects/{pid}/graph').json()
+  assert len(g['edges'])==202
+  expected=[edge for edge in g['edges'] if edge['source'] in page_ids or edge['target'] in page_ids]
+  assert page['edges']==expected
+  assert any(edge['relation']=='incoming-test' for edge in page['edges'])
+  assert any(edge['relation']=='outgoing-test' for edge in page['edges'])
+  assert not any(edge['relation'] in {'unrelated-test','foreign-project-test'} for edge in page['edges'])
+  assert any((edge['source'] in page_ids)!=(edge['target'] in page_ids) for edge in page['edges'])
   positions={f'n{i}':{'x':i*5,'y':i*3} for i in range(200)}
   layout=c.post(f'/api/projects/{pid}/graph/batch',json={'request_id':'atomic-layout','expected_revision':g['revision'],'commands':[{'operation':'edit_node','targets':list(positions),'params':{'positions':positions}}]})
   assert layout.status_code==200,layout.text
