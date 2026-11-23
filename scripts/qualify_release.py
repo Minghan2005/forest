@@ -114,16 +114,50 @@ def prime_oracle(artifacts):
     if numbers(metrics).count(expected)<2: failures.append(f'Metrics must preserve both actual counts equal to independently recomputed {expected}')
     if not artifacts.get('report.md','').strip(): failures.append('Missing report.md')
     functions=[]
+    def source_module(path):
+        module=path[:-3].replace('\\','.').replace('/','.') if path.endswith('.py') else path.replace('\\','.').replace('/','.')
+        return module[:-9] if module.endswith('.__init__') else module
     for path,source in artifacts.items():
         if not path.endswith('.py'): continue
         try: tree=ast.parse(source)
         except SyntaxError: failures.append(f'Invalid Python source: {path}'); continue
+        module=source_module(path)
+        imported={}
+        defined={node.name for node in ast.walk(tree) if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Import):
+                for alias in node.names:
+                    local=alias.asname or alias.name.split('.')[0]
+                    imported[local]=alias.name
+            elif isinstance(node,ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    local=alias.asname or alias.name
+                    imported[local]=f'{node.module}.{alias.name}'
         for function in ast.walk(tree):
             if isinstance(function,(ast.FunctionDef,ast.AsyncFunctionDef)):
-                functions.append({'source':path,'name':function.name,'remainder_operations':sum(isinstance(n,ast.Mod) for n in ast.walk(function)),'body':ast.dump(ast.Module(body=function.body,type_ignores=[])), 'indexed_writes':sum(isinstance(n,ast.Subscript) and isinstance(n.ctx,ast.Store) for n in ast.walk(function)), 'called_functions':[n.func.id for n in ast.walk(function) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)]})
+                called=set()
+                for call in (n for n in ast.walk(function) if isinstance(n,ast.Call)):
+                    target=call.func
+                    if isinstance(target,ast.Name):
+                        called.add(target.id)
+                        if target.id in imported:
+                            called.add(imported[target.id])
+                        elif target.id in defined:
+                            called.add(f'{module}.{target.id}')
+                    elif isinstance(target,ast.Attribute):
+                        called.add(target.attr)
+                        parts=[target.attr]
+                        value=target.value
+                        while isinstance(value,ast.Attribute):
+                            parts.append(value.attr); value=value.value
+                        if isinstance(value,ast.Name):
+                            root=imported.get(value.id,value.id)
+                            if value.id in imported or value.id in defined:
+                                called.add('.'.join([root,*reversed(parts)]))
+                functions.append({'source':path,'module':module,'name':function.name,'qualified_name':f'{module}.{function.name}','remainder_operations':sum(isinstance(n,ast.Mod) for n in ast.walk(function)),'body':ast.dump(ast.Module(body=function.body,type_ignores=[])), 'indexed_writes':sum(isinstance(n,ast.Subscript) and isinstance(n.ctx,ast.Store) for n in ast.walk(function)), 'called_functions':sorted(called)})
     trial=[f for f in functions if f['remainder_operations']>0]
     sieve=[f for f in functions if ('sieve' in f['name'].lower() or 'eratosthenes' in f['name'].lower()) and f['remainder_operations']==0 and f['indexed_writes']>0]
-    if not any(a['body']!=b['body'] and a['name'] not in b['called_functions'] for a in trial for b in sieve): failures.append('Source inspection did not find distinct trial-division and sieve implementations')
+    if not any(a['body']!=b['body'] and a['name'] not in b['called_functions'] and a['qualified_name'] not in b['called_functions'] for a in trial for b in sieve): failures.append('Source inspection did not find distinct trial-division and sieve implementations')
     return failures,{'expected_count':expected,'functions':functions,'scope':'Structural source check and exact output oracle; preserved source remains available for human algorithm review.'}
 
 

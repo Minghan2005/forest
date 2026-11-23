@@ -88,6 +88,20 @@ def test_prime_oracle_rejects_algorithm_alias_and_fabricated_counts():
     assert any('counts' in f for f in prime_oracle(artifacts)[0])
 
 
+def test_prime_oracle_rejects_sieve_delegation_through_module_and_import_aliases():
+    trial='def trial_division(limit):\n return [n for n in range(2,limit+1) if all(n%d for d in range(2,math.isqrt(n)+1))]\n'
+    wrappers=[
+        'import trial_impl as helper\ndef sieve_eratosthenes(limit):\n result=[]\n for prime in helper.trial_division(limit):\n  result[len(result):]=[prime]\n return result\n',
+        'from trial_impl import trial_division as divide\ndef sieve_eratosthenes(limit):\n result=[]\n for prime in divide(limit):\n  result[len(result):]=[prime]\n return result\n',
+    ]
+    for wrapper in wrappers:
+        artifacts={'metrics.json':json.dumps({'trial_count':1229,'sieve_count':1229}),
+                   'report.md':'Both implementations were claimed to be independent.',
+                   'trial_impl.py':'import math\n'+trial,'sieve_copy.py':wrapper}
+        failures,_=prime_oracle(artifacts)
+        assert any('distinct trial-division and sieve implementations' in failure for failure in failures)
+
+
 def test_source_archive_excludes_runtime_and_credentials(tmp_path):
     (tmp_path/'README.md').write_text('Public source')
     (tmp_path/'services').mkdir(); (tmp_path/'services/api.py').write_text('print(1)')
